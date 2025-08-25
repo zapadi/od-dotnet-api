@@ -5,6 +5,7 @@ on:
     branches: [ main, develop, release/* ]
     tags:     [ "*" ]      
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: dotnet-build-${{ github.ref }}
