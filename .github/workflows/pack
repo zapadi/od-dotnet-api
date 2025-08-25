@@ -1,0 +1,147 @@
+name: Pack & Publish
+
+on:
+  # auto: runs after Build succeeds
+  workflow_run:
+    workflows: [ ".NET Build" ]
+    types: [ completed ]
+  # manual: run anytime
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (SemVer recommended, e.g. 1.2.3 or 1.2.3-beta1)"
+        required: true
+        type: string
+      target_ref:
+        description: "Commit/branch to release (default: main)"
+        required: false
+        type: string
+        default: "main"
+      force_publish:
+        description: "Allow publish even if version is NOT SemVer (manual only)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+concurrency:
+  group: dotnet-pack-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  pack:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      NUGET_SOURCE: https://api.nuget.org/v3/index.json
+    steps:
+      - name: Determine source and checkout
+        id: co
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event_name == 'workflow_dispatch' && github.repository || github.event.workflow_run.head_repository.full_name }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '9.x.x' }
+
+      - name: Resolve version/tag
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          regex='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            ver="${{ inputs.version }}"
+            tag="v${ver}"
+            if [[ ! "$ver" =~ $regex ]] && [[ "${{ inputs.force_publish }}" != "true" ]]; then
+              echo "Manual version '$ver' is not SemVer and force_publish is false." >&2
+              exit 1
+            fi
+            prev="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+            target="$(git rev-parse HEAD)"
+          else
+            git fetch --tags --force
+            tag="$(git describe --tags --exact-match 2>/dev/null || true)"
+            if [[ -z "$tag" ]]; then
+              echo "No tag on this commit; nothing to publish (auto run)." >&2
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            if [[ ! "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "Tag '$tag' is not SemVer; skipping (auto run only publishes SemVer)." >&2
+              echo "skip=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            ver="${tag#v}"
+            prev="$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)"
+            target="$(git rev-parse HEAD)"
+          fi
+
+          echo "skip=false"     >> $GITHUB_OUTPUT
+          echo "tag=$tag"       >> $GITHUB_OUTPUT
+          echo "version=$ver"   >> $GITHUB_OUTPUT
+          echo "prev=$prev"     >> $GITHUB_OUTPUT
+          echo "target=$target" >> $GITHUB_OUTPUT
+
+      - name: Stop (auto) when not SemVer
+        if: steps.ver.outputs.skip == 'true'
+        run: exit 0
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build (CI)
+        run: dotnet build -c Release --no-restore -p:ContinuousIntegrationBuild=true
+
+      - name: Pack
+        run: dotnet pack -c Release -o artifacts -p:PackageVersion=${{ steps.ver.outputs.version }} --no-build
+
+      - name: Generate CHANGELOG
+        id: changelog
+        shell: bash
+        run: |
+          tag="${{ steps.ver.outputs.tag }}"
+          prev="${{ steps.ver.outputs.prev }}"
+          target="${{ steps.ver.outputs.target }}"
+          {
+            echo "## ${tag}"
+            echo
+            if [[ -n "$prev" ]]; then
+              echo "_Changes since ${prev}_"
+              echo
+              git log --no-merges --pretty="* %s (%h) by %an" "${prev}..${target}"
+            else
+              echo "_Initial release_"
+              echo
+              git log --no-merges --pretty="* %s (%h) by %an"
+            fi
+            echo
+          } > changelog.md
+          echo "path=changelog.md" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ steps.ver.outputs.version }}
+          path: |
+            artifacts/*.nupkg
+            changelog.md
+
+      - name: Publish to NuGet
+        run: dotnet nuget push "artifacts/*.nupkg" -k "${{ secrets.NUGET_API_KEY }}" -s "$NUGET_SOURCE" --skip-duplicate
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ steps.ver.outputs.target }}
+          body_path: ${{ steps.changelog.outputs.path }}
+          files: artifacts/*.nupkg
+          prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
